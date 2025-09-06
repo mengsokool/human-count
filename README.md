@@ -10,8 +10,8 @@
 - ไฟล์โมเดล YOLO: วาง `yolo11n.onnx` ไว้ในโฟลเดอร์ทำงาน หรือกำหนดผ่าน `MODEL_PATH`
 
 **เริ่มรัน**
-- Development: `uvicorn app:app --reload`
-- Production (ตัวอย่าง): `uvicorn app:app --host 0.0.0.0 --port 8000` 
+- Development: `uvicorn main:app --reload`
+- Production (ตัวอย่าง): `uvicorn main:app --host 0.0.0.0 --port 8000` 
 
 **การตั้งค่า (Environment Variables)**
 - `DB_PATH`: พาธฐานข้อมูล SQLite (ค่าเริ่มต้น `subs.db`)
