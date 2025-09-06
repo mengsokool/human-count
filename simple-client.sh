@@ -6,7 +6,7 @@ curl -s -X POST http://localhost:8000/subscribe \
 # สมมุติได้ {"subscription_token":"Oem6raDJedbc"}
 
 # เปิด SSE
-curl -N http://localhost:8000/stream/W1PuWkiyH1vz
+curl -N http://localhost:8000/stream/Pa01qWRbBASi
 
 # ดูรายการ
 curl -s http://localhost:8000/subs | jq .

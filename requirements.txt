@@ -1,8 +1,8 @@
+ultralytics==8.3.0
+torch>=2.0.0
+numpy
 opencv-python
-onnxruntime
-onvif-zeep
 requests
 fastapi
 pydantic>=2
 uvicorn[standard]
-numpy
