@@ -1,4 +1,5 @@
-# Human Count + SSE
+# Human Counting Service (YOLOv11-nano) with SSE streaming
+<img width="770" height="498" alt="image" src="https://github.com/user-attachments/assets/ba101dd6-6509-4ab8-ab8d-26466ef75e94" />
 
 **ภาพรวม**
 - นับจำนวนคนจาก snapshot ด้วย Ultralytics YOLO แล้วสตรีมผลแบบ SSE
