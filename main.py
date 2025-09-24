@@ -16,17 +16,24 @@ from pydantic import BaseModel, AnyUrl, field_validator
 from ultralytics import YOLO
 
 # ================== Config ==================
+# ตั้งค่าพื้นฐานของระบบผ่าน env var (ปรับได้ตามสภาพแวดล้อมจริง)
 DB_PATH = os.getenv("DB_PATH", "subs.db")
-MODEL_PATH = os.getenv("MODEL_PATH", "yolo11n.pt")  # ใช้ .pt
+MODEL_PATH = os.getenv("MODEL_PATH", "yolo11s.pt")
 IMG_SIZE = int(os.getenv("IMG_SIZE", "640"))
-CONF_THRES = float(os.getenv("CONF_THRES", "0.35"))
-IOU_THRES = float(os.getenv("IOU_THRES", "0.45"))
-PERSON_CLASS_ID = int(os.getenv("PERSON_CLASS_ID", "0"))
-HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "15"))
+CONF_THRES = float(os.getenv("CONF_THRES", "0.3"))   # filter ชั้น model: กรองกล่อง conf ต่ำออกไปเลย (ลด noise + เบา CPU)
+IOU_THRES = float(os.getenv("IOU_THRES", "0.45"))   # Non-Max Suppression threshold
+PERSON_CLASS_ID = int(os.getenv("PERSON_CLASS_ID", "0"))  # class id ของ "person"
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "15"))     # ส่ง heartbeat กัน connection ตาย
+
+# logic filter ชั้น behavior
+STABLE_WINDOW = int(os.getenv("STABLE_WINDOW", "5"))  # ความยาว sliding window เก็บ history count
+STABLE_FRAMES = int(os.getenv("STABLE_FRAMES", "3"))  # ต้องเจอ "0 คน" ติดกัน n frame ถึงจะปิดไฟ
+INSTANT_CONF = float(os.getenv("INSTANT_CONF", "0.32"))  # conf ขั้นต่ำสำหรับ instant detect (เปิดไฟเร็ว)
 
 # ================== App & DB ==================
-app = FastAPI(title="Human Count from Snapshot", version="0.4.0")
+app = FastAPI(title="Human Count from Snapshot", version="0.8.0")
 
+# ใช้ SQLite เก็บ token/subscription (เบา + portable)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.execute("""
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -39,6 +46,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 conn.commit()
 
 # ================== Token ==================
+# สร้าง token ใหม่แบบ random (ใช้เป็น key สำหรับ stream)
 def new_token(n: int = 12) -> str:
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     return "".join(secrets.choice(alphabet) for _ in range(n))
@@ -54,28 +62,32 @@ class SubscribeIn(BaseModel):
         return v
 
 # ================== YOLO Model ==================
+# โหลดโมเดล YOLO
 model = YOLO(MODEL_PATH)
 
-def infer_person_count(frame: np.ndarray) -> int:
+# ฟังก์ชัน infer: รับ frame → detect คน → คืน count + confidence list
+def infer_person_count(frame: np.ndarray):
     results = model.predict(
         source=frame,
         imgsz=IMG_SIZE,
-        conf=CONF_THRES,
+        conf=CONF_THRES,   # กรองตั้งแต่ระดับ model
         iou=IOU_THRES,
         verbose=False
     )
-    # results[0].boxes มี boxes, conf, cls
     boxes = results[0].boxes
     if boxes is None:
-        return 0
+        return 0, []
     cls_ids = boxes.cls.cpu().numpy().astype(int)
     confs = boxes.conf.cpu().numpy()
     mask = (cls_ids == PERSON_CLASS_ID) & (confs >= CONF_THRES)
-    return int(np.sum(mask))
+    person_confs = confs[mask]
+    count = int(np.sum(mask))
+    return count, person_confs.tolist()
 
+# ดึง snapshot จากกล้อง (เป็น JPEG) → คืน bytes
 def fetch_snapshot_requests(url: str) -> bytes:
     r = requests.get(url, headers={
-        "User-Agent": "human-count/0.4",
+        "User-Agent": "human-count/0.8",
         "Accept": "image/jpeg,*/*",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
@@ -85,6 +97,7 @@ def fetch_snapshot_requests(url: str) -> bytes:
     return r.content
 
 # ================== Worker ==================
+# worker = ตัวทำงานจริง: loop ดึง snapshot → detect → push SSE
 class Worker:
     def __init__(self, token: str, url: str, interval: int):
         self.token = token
@@ -93,6 +106,10 @@ class Worker:
         self.queues: Set[asyncio.Queue] = set()
         self.task: Optional[asyncio.Task] = None
         self._last = 0.0
+
+        # state machine สำหรับ instant/stable
+        self.history = []               # เก็บ count ย้อนหลัง
+        self.last_state = "no_person"   # state ล่าสุด ("person" หรือ "no_person")
 
     def add(self, q): self.queues.add(q)
     def remove(self, q): self.queues.discard(q)
@@ -106,7 +123,7 @@ class Worker:
                 self.queues.discard(q)
 
     async def revoke(self):
-        # Notify clients and close their streams
+        # แจ้ง client ว่า token ถูกลบ แล้วปิด stream
         for q in list(self.queues):
             try:
                 q.put_nowait("event: revoked\ndata: token deleted\n\n")
@@ -115,29 +132,60 @@ class Worker:
                 self.queues.discard(q)
 
     async def run(self):
-        backoff = 1.0
+        backoff = 1.0  # ค่าเริ่มต้น exponential backoff
         while self.has_subs():
             t0 = time.time()
             try:
+                # ดึง snapshot จากกล้อง
                 content = await asyncio.to_thread(fetch_snapshot_requests, self.url)
                 arr = np.frombuffer(content, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is None:
                     raise RuntimeError("decode fail")
 
-                count = await asyncio.to_thread(infer_person_count, frame)
-                await self.push(f"event: count\ndata: {count}\n\n")
+                # infer → ได้ count + conf
+                count, conf_list = await asyncio.to_thread(infer_person_count, frame)
+                conf_max = max(conf_list, default=0.0)
+
+                # --- instant detect: เปิดไฟทันทีถ้าเจอ conf สูง ---
+                if count > 0 and conf_max >= INSTANT_CONF and self.last_state == "no_person":
+                    self.last_state = "person"
+
+                # --- stable detect: ปิดไฟช้า (ต้องเจอ 0 ติดกัน n frame) ---
+                self.history.append(count)
+                if len(self.history) > STABLE_WINDOW:
+                    self.history.pop(0)
+                if len(self.history) >= STABLE_FRAMES:
+                    if all(c == 0 for c in self.history[-STABLE_FRAMES:]) and self.last_state == "person":
+                        self.last_state = "no_person"
+
+                # --- publish state-based count (output ที่นิ่งกว่า raw) ---
+                publish_val = 1 if self.last_state == "person" else 0
+                await self.push(f"event: count\ndata: {publish_val}\n\n")
+
+                # --- log raw detect (เอาไว้ debug/conf tuning) ---
+                log_conf = ", ".join([f"{c*100:.2f}%" for c in conf_list])
+                log_msg = f"เจอคน {count} คน: {log_conf}"
+                await self.push(f"event: log\ndata: {log_msg}\n\n")
+
                 self._last = t0
                 backoff = 1.0
+
             except Exception as e:
+                # error → push event ไปหา client
                 await self.push(f"event: error\ndata: {json.dumps({'err': str(e)[:100]})}\n\n")
                 await asyncio.sleep(min(backoff, 10.0))
-                backoff *= 1.5
+                backoff *= 1.5  # เพิ่ม delay ทีละ step
+
+            # ส่ง heartbeat กัน connection timeout
             if time.time() - self._last > HEARTBEAT_SEC:
                 await self.push(": ping\n\n")
                 self._last = time.time()
+
+            # รอให้ครบ interval ที่กำหนด (publish steady)
             await asyncio.sleep(max(0.0, self.interval - (time.time() - t0)))
 
+# Manager = ดูแล worker หลายตัวพร้อมกัน (ตาม token)
 class Manager:
     def __init__(self): 
         self.ws: Dict[str, Worker] = {}
@@ -172,6 +220,7 @@ class Manager:
 manager = Manager()
 
 # ================== Routes ==================
+# สมัคร subscription ใหม่
 @app.post("/subscribe")
 def subscribe(inp: SubscribeIn):
     token = new_token()
@@ -183,11 +232,13 @@ def subscribe(inp: SubscribeIn):
         )
     return {"subscription_token": token}
 
+# ดูรายการ subs ทั้งหมด
 @app.get("/subs")
 def list_subs():
     rows = conn.execute("SELECT token,snapshot_url,interval_sec,created_at FROM subscriptions").fetchall()
     return {"items": [{"token": t, "url": u, "interval": i, "created_at": ts} for (t, u, i, ts) in rows]}
 
+# ลบ subscription
 @app.delete("/subs/{token}")
 async def delete_sub(token: str):
     with conn:
@@ -197,6 +248,7 @@ async def delete_sub(token: str):
     await manager.revoke(token)
     return {"ok": True}
 
+# เปิด SSE stream สำหรับ token
 @app.get("/stream/{token}")
 async def stream(token: str, request: Request):
     row = conn.execute("SELECT snapshot_url,interval_sec FROM subscriptions WHERE token=?", (token,)).fetchone()
@@ -209,7 +261,7 @@ async def stream(token: str, request: Request):
 
     async def gen():
         try:
-            yield ": hello\n\n"
+            yield ": hello\n\n"  # initial hello
             while True:
                 if await request.is_disconnected():
                     break
