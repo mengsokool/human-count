@@ -6,6 +6,7 @@ import secrets
 import asyncio
 from typing import Dict, Set, Optional
 import requests
+from collections import Counter
 
 import cv2
 import numpy as np
@@ -110,6 +111,7 @@ class Worker:
         # state machine สำหรับ instant/stable
         self.history = []               # เก็บ count ย้อนหลัง
         self.last_state = "no_person"   # state ล่าสุด ("person" หรือ "no_person")
+        self.last_count = 0
 
     def add(self, q): self.queues.add(q)
     def remove(self, q): self.queues.discard(q)
@@ -155,12 +157,18 @@ class Worker:
                 self.history.append(count)
                 if len(self.history) > STABLE_WINDOW:
                     self.history.pop(0)
-                if len(self.history) >= STABLE_FRAMES:
-                    if all(c == 0 for c in self.history[-STABLE_FRAMES:]) and self.last_state == "person":
-                        self.last_state = "no_person"
+
+                if len(self.history) >= STABLE_FRAMES and all(c == 0 for c in self.history[-STABLE_FRAMES:]) and self.last_state == "person":
+                    self.last_state = "no_person"
+                    self.last_count = 0
+                elif self.last_state == "person":
+                    non_zero_history = [c for c in self.history if c > 0]
+                    if non_zero_history:
+                        # ใช้ mode ใน window เพื่อลดการสวิงจากกล่อง YOLO
+                        self.last_count = Counter(non_zero_history).most_common(1)[0][0]
 
                 # --- publish state-based count (output ที่นิ่งกว่า raw) ---
-                publish_val = 1 if self.last_state == "person" else 0
+                publish_val = self.last_count if self.last_state == "person" else 0
                 await self.push(f"event: count\ndata: {publish_val}\n\n")
 
                 # --- log raw detect (เอาไว้ debug/conf tuning) ---
@@ -276,3 +284,4 @@ async def stream(token: str, request: Request):
             w.remove(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
