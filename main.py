@@ -6,7 +6,6 @@ import secrets
 import asyncio
 from typing import Dict, Set, Optional
 import requests
-from collections import Counter
 
 import cv2
 import numpy as np
@@ -161,12 +160,8 @@ class Worker:
                 if len(self.history) >= STABLE_FRAMES and all(c == 0 for c in self.history[-STABLE_FRAMES:]) and self.last_state == "person":
                     self.last_state = "no_person"
                     self.last_count = 0
-                elif self.last_state == "person":
-                    non_zero_history = [c for c in self.history if c > 0]
-                    if non_zero_history:
-                        # ใช้ mode ใน window เพื่อลดการสวิงจากกล่อง YOLO
-                        self.last_count = Counter(non_zero_history).most_common(1)[0][0]
-
+                elif count > 0 and self.last_state == "person":
+                    self.last_count = count
                 # --- publish state-based count (output ที่นิ่งกว่า raw) ---
                 publish_val = self.last_count if self.last_state == "person" else 0
                 await self.push(f"event: count\ndata: {publish_val}\n\n")
@@ -284,4 +279,3 @@ async def stream(token: str, request: Request):
             w.remove(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
-
